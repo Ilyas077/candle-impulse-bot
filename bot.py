@@ -3,16 +3,18 @@ import time
 import base64
 import datetime
 import requests
+import numpy as np
 import pandas as pd
 
 # --- 1. НАСТРОЙКИ ---
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = "531386055"
 
+# Добавили UNIUSDT и основные ликвидные пары
 SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "INJUSDT", 
-    "SUIUSDT", "XRPUSDT", "AVAXUSDT", "TAOUSDT", 
-    "HYPEUSDT", "ENAUSDT", "JTOUSDT", "AAVEUSDT"
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", 
+    "UNIUSDT", "AVAXUSDT", "SUIUSDT", "INJUSDT", 
+    "AAVEUSDT", "JTOUSDT", "ENAUSDT", "TAOUSDT"
 ]
 
 HEADERS = {
@@ -20,39 +22,45 @@ HEADERS = {
     "Accept": "application/json"
 }
 
-CB_BASE = base64.b64decode("aHR0cHM6Ly9hcGkuZXhjaGFuZ2UuY29pbmJhc2UuY29tL3Byb2R1Y3RzLw==").decode()
 BV_URL = base64.b64decode("aHR0cHM6Ly9kYXRhLWFwaS5iaW5hbmNlLnZpc2lvbi9hcGkvdjMva2xpbmVz").decode()
+CB_BASE = base64.b64decode("aHR0cHM6Ly9hcGkuZXhjaGFuZ2UuY29pbmJhc2UuY29tL3Byb2R1Y3RzLw==").decode()
 TG_API_BASE = base64.b64decode("aHR0cHM6Ly9hcGkudGVsZWdyYW0ub3JnL2JvdA==").decode()
 
 # --- 2. ОТПРАВКА В TELEGRAM ---
 def send_telegram(message):
     if not TG_TOKEN:
-        print("Ошибка: Токен не найден в Secrets!")
         return
     url = f"{TG_API_BASE}{TG_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=10)
-        if r.status_code != 200:
-            print(f"Ошибка Telegram API: {r.text}")
+        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=10)
     except Exception as e:
         print(f"Сбой отправки: {e}")
 
 # --- 3. ПОЛУЧЕНИЕ СВЕЧЕЙ (15M И 30M) ---
-def get_candles(symbol, timeframe="15m", limit=20):
+def get_candles(symbol, timeframe="15m", limit=50):
+    try:
+        r_bv = requests.get(BV_URL, params={"symbol": symbol, "interval": timeframe, "limit": limit}, headers=HEADERS, timeout=10)
+        if r_bv.status_code == 200:
+            data_bv = r_bv.json()
+            if isinstance(data_bv, list) and len(data_bv) >= 30:
+                df = pd.DataFrame([row[:6] for row in data_bv], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = df[col].astype(float)
+                return df
+    except Exception:
+        pass
+
     coin = symbol.replace("USDT", "")
-    
-    # Канал 1: Coinbase (поддерживает 15m; для 30m склеиваем из 15m)
     url_cb = f"{CB_BASE}{coin}-USD/candles"
     try:
         r = requests.get(url_cb, params={"granularity": 900}, headers=HEADERS, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            if isinstance(data, list) and len(data) >= 15:
+            if isinstance(data, list) and len(data) >= 30:
                 df = pd.DataFrame(data[:limit*2], columns=['timestamp', 'low', 'high', 'open', 'close', 'volume'])
                 df = df.iloc[::-1].reset_index(drop=True)
-                for col in ['open', 'high', 'low', 'close']:
+                for col in ['open', 'high', 'low', 'close', 'volume']:
                     df[col] = df[col].astype(float)
-                
                 if timeframe == "15m":
                     return df.tail(limit).reset_index(drop=True)
                 elif timeframe == "30m":
@@ -65,90 +73,118 @@ def get_candles(symbol, timeframe="15m", limit=20):
     except Exception:
         pass
 
-    # Канал 2: Зеркало Binance Vision
-    try:
-        r_bv = requests.get(BV_URL, params={"symbol": symbol, "interval": timeframe, "limit": limit}, headers=HEADERS, timeout=10)
-        if r_bv.status_code == 200:
-            data_bv = r_bv.json()
-            if isinstance(data_bv, list) and len(data_bv) >= 10:
-                df = pd.DataFrame([row[:6] for row in data_bv], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                for col in ['open', 'high', 'low', 'close']:
-                    df[col] = df[col].astype(float)
-                return df
-    except Exception:
-        pass
-
     return None
 
-# --- 4. ПРОВЕРКА 3 ПОСЛЕДОВАТЕЛЬНЫХ СВЕЧЕЙ ---
-def check_3_candles(symbol, timeframe):
-    df = get_candles(symbol, timeframe=timeframe, limit=15)
-    if df is None or len(df) < 5:
+# --- 4. РАСЧЕТ ПОЛОС БОЛЛИНДЖЕРА И RSI ---
+def add_reversal_indicators(df):
+    # Полосы Боллинджера (период 20, отклонение 2.1 для ловли крайних пиков)
+    df['sma20'] = df['close'].rolling(window=20).mean()
+    std20 = df['close'].rolling(window=20).std()
+    df['bb_upper'] = df['sma20'] + (std20 * 2.1)
+    df['bb_lower'] = df['sma20'] - (std20 * 2.1)
+
+    # RSI (14)
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+
+    return df
+
+# --- 5. ПОИСК РАЗВОРОТА С САМОГО ДНА ИЛИ ВЕРШИНЫ ---
+def check_reversal(symbol, timeframe):
+    df = get_candles(symbol, timeframe=timeframe, limit=50)
+    if df is None or len(df) < 25:
         return None
 
-    c1 = df.iloc[-4]
-    c2 = df.iloc[-3]
-    c3 = df.iloc[-2]
+    df = add_reversal_indicators(df)
+    
+    curr = df.iloc[-2]  # Последняя закрытая свеча
+    prev = df.iloc[-3]  # Предыдущая свеча
+    price = curr['close']
+    rsi = round(curr['rsi'], 1)
 
-    # ЛОНГ (3 зеленые свечи подряд, каждая закрывается выше предыдущей)
-    is_3_green = (c1['close'] > c1['open']) and (c2['close'] > c2['open']) and (c3['close'] > c3['open'])
-    higher_closes = (c3['close'] > c2['close']) and (c2['close'] > c1['close'])
+    # Размеры теней свечи (для определения отскока / снятия стопов)
+    body = abs(curr['close'] - curr['open'])
+    lower_wick = min(curr['open'], curr['close']) - curr['low']
+    upper_wick = curr['high'] - max(curr['open'], curr['close'])
 
-    if is_3_green and higher_closes:
-        price = c3['close']
-        move_pct = round(((price - c1['open']) / c1['open']) * 100, 2)
+    # --- ЛОНГ С САМОГО НИЗА ---
+    # Условия: 1) Минимум проколол нижнюю полосу Боллинджера (или предыдущая свеча закрылась ниже)
+    # 2) RSI ниже 32 (перепроданность)
+    # 3) Текущая свеча закрылась зеленой ИЛИ оставила длинную нижнюю тень (откуп снизу)
+    touched_bottom = (curr['low'] <= curr['bb_lower']) or (prev['close'] <= prev['bb_lower'])
+    bullish_rejection = (curr['close'] > curr['open']) or (lower_wick > body * 1.2)
+
+    if touched_bottom and rsi <= 33 and bullish_rejection:
+        sl = round(min(curr['low'], prev['low']) * 0.997, 4) # Стоп чуть ниже тени прокола
+        tp = round(curr['sma20'], 4) # Первая цель — возврат к середине канала (SMA20)
+        # Если до середины канала слишком близко, ставим тейк +1.5%
+        if (tp - price) / price < 0.008:
+            tp = round(price * 1.015, 4)
+
         return (
-            f"🟩🟩🟩 <b>3 СВЕЧИ ВВЕРХ — ЛОНГ ({timeframe})</b>\n\n"
+            f"🧲🟢 <b>ЛОВЕЦ ДНА — ЛОНГ ({timeframe})</b>\n\n"
             f"🪙 Монета: <b>#{symbol}</b>\n"
-            f"💵 Текущая цена: <code>{round(price, 4)}</code>\n"
-            f"📈 Импульс за 3 свечи: <b>+{move_pct}%</b>\n"
-            f"🛡️ Ориентир стопа (за 2-ю свечу): <code>{round(c2['low'], 4)}</code>"
+            f"💵 Вход (откуп снизу): <code>{round(price, 4)}</code>\n"
+            f"🛡️ Стоп (за тень дна): <code>{sl}</code>\n"
+            f"💰 Тейк (к центру канала): <code>{tp}</code>\n\n"
+            f"📊 RSI: <b>{rsi}</b> (экстремум перепроданности)\n"
+            f"💡 <i>Снята нижняя ликвидность за каналом Боллинджера, пошел откуп.</i>"
         )
 
-    # ШОРТ (3 красные свечи подряд, каждая закрывается ниже предыдущей)
-    is_3_red = (c1['close'] < c1['open']) and (c2['close'] < c2['open']) and (c3['close'] < c3['open'])
-    lower_closes = (c3['close'] < c2['close']) and (c2['close'] < c1['close'])
+    # --- ШОРТ С САМОГО ВЕРХА ---
+    # Условия: 1) Максимум проколол верхнюю полосу Боллинджера
+    # 2) RSI выше 68 (перекупленность)
+    # 3) Текущая свеча закрылась красной ИЛИ оставила длинную верхнюю тень (продажа сверху)
+    touched_top = (curr['high'] >= curr['bb_upper']) or (prev['close'] >= prev['bb_upper'])
+    bearish_rejection = (curr['close'] < curr['open']) or (upper_wick > body * 1.2)
 
-    if is_3_red and lower_closes:
-        price = c3['close']
-        move_pct = round(((c1['open'] - price) / c1['open']) * 100, 2)
+    if touched_top and rsi >= 67 and bearish_rejection:
+        sl = round(max(curr['high'], prev['high']) * 1.003, 4) # Стоп чуть выше тени пика
+        tp = round(curr['sma20'], 4) # Первая цель — возврат к середине канала
+        if (price - tp) / price < 0.008:
+            tp = round(price * 0.985, 4)
+
         return (
-            f"🟥🟥🟥 <b>3 СВЕЧИ ВНИЗ — ШОРТ ({timeframe})</b>\n\n"
+            f"🧲🔴 <b>ЛОВЕЦ ПИКА — ШОРТ ({timeframe})</b>\n\n"
             f"🪙 Монета: <b>#{symbol}</b>\n"
-            f"💵 Текущая цена: <code>{round(price, 4)}</code>\n"
-            f"📉 Импульс за 3 свечи: <b>-{move_pct}%</b>\n"
-            f"🛡️ Ориентир стопа (за 2-ю свечу): <code>{round(c2['high'], 4)}</code>"
+            f"💵 Вход (отбой сверху): <code>{round(price, 4)}</code>\n"
+            f"🛡️ Стоп (за тень пика): <code>{sl}</code>\n"
+            f"💰 Тейк (к центру канала): <code>{tp}</code>\n\n"
+            f"📊 RSI: <b>{rsi}</b> (экстремум перекупленности)\n"
+            f"💡 <i>Прокол верхней границы канала, началась фиксация прибыли.</i>"
         )
 
     return None
 
-# --- 5. ЗАПУСК ---
+# --- 6. ЗАПУСК ---
 if __name__ == "__main__":
-    print("Запуск свечного сканера (15m и 30m)...")
     current_minute = datetime.datetime.now().minute
     is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
 
     if is_manual:
-        send_telegram("🕯️ <b>Свечной бот (15m / 30m) запущен!</b> Ищу серии из 3 свечей...")
+        send_telegram("🧲 <b>Бот «Ловец Дна и Пиков» (15m / 30m) запущен!</b>\nИщу проколы границ канала и откупы по RSI.")
 
     found = 0
     check_30m_now = (current_minute < 15) or (30 <= current_minute < 45) or is_manual
 
     for symbol in SYMBOLS:
-        msg_15 = check_3_candles(symbol, "15m")
+        msg_15 = check_reversal(symbol, "15m")
         if msg_15:
             send_telegram(msg_15)
             found += 1
         
         if check_30m_now:
-            msg_30 = check_3_candles(symbol, "30m")
+            msg_30 = check_reversal(symbol, "30m")
             if msg_30:
                 send_telegram(msg_30)
                 found += 1
                 
-        time.sleep(0.5)
+        time.sleep(0.3)
 
     if is_manual and found == 0:
-        send_telegram("🕯️ Проверка 15m и 30m завершена. Сейчас ни по одной монете нет серии из 3 свечей подряд.")
-    
-    print(f"Сканирование завершено. Найдено сигналов: {found}")
+        send_telegram("🧲 Проверка 12 монет завершена. Сейчас цены внутри каналов, крайних пиков для разворота нет.")
