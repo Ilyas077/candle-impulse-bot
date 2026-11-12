@@ -1,9 +1,8 @@
 import os
 import time
-import datetime
 import requests
 
-# --- 1. НАСТРОЙКИ (ИЗ ВАШЕГО СТАРОГО КОДА) ---
+# --- 1. НАСТРОЙКИ ---
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = "531386055"
 
@@ -38,7 +37,6 @@ def get_6_metrics(symbol):
         fapi = "https://binance.com"
         spot = "https://binance.com"
         
-        # 1. Свечи фьючерсов (60 штук = 5 часов для поиска локального дна/пика)
         r_fk = requests.get(f"{fapi}/fapi/v1/klines", params={"symbol": symbol, "interval": TIMEFRAME, "limit": 60}, headers=HEADERS, timeout=8)
         if r_fk.status_code == 200:
             fk = r_fk.json()
@@ -54,36 +52,30 @@ def get_6_metrics(symbol):
             close_p = float(c_last[4])
             price_pos = (close_p - min_p) / (max_p - min_p) if max_p != min_p else 0.5
 
-            # 2. Фьючерсная дельта (CVD)
             def calc_delta(k):
-                tot_v = float(k[7]) # Объем в USDT
-                buy_v = float(k[10]) # Покупки по рынку в USDT
+                tot_v = float(k[7])
+                buy_v = float(k[10])
                 return buy_v - (tot_v - buy_v)
 
             f_delta_prev = calc_delta(c_prev)
             f_delta_last = calc_delta(c_last)
 
-            # 3. Спотовая дельта (CVD спота)
             r_sk = requests.get(f"{spot}/api/v3/klines", params={"symbol": symbol, "interval": TIMEFRAME, "limit": 3}, headers=HEADERS, timeout=8).json()
             s_delta_last = calc_delta(r_sk[-2])
 
-            # 4. Открытый интерес (OI)
             r_oi = requests.get(f"{fapi}/futures/data/openInterestHist", params={"symbol": symbol, "period": TIMEFRAME, "limit": 2}, headers=HEADERS, timeout=8).json()
             oi_prev = float(r_oi[-2]["sumOpenInterest"])
             oi_last = float(r_oi[-1]["sumOpenInterest"])
             oi_diff_pct = ((oi_last - oi_prev) / oi_prev) * 100
 
-            # 5. Стакан ордеров (Биды и Аски топ-50)
             r_ob = requests.get(f"{fapi}/fapi/v1/depth", params={"symbol": symbol, "limit": 50}, headers=HEADERS, timeout=8).json()
             bids_usdt = sum(float(b[0]) * float(b[1]) for b in r_ob["bids"])
             asks_usdt = sum(float(a[0]) * float(a[1]) for a in r_ob["asks"])
             ob_ratio = bids_usdt / asks_usdt if asks_usdt > 0 else 1.0
 
-            # 6. Ставка финансирования (Funding Rate)
             r_fr = requests.get(f"{fapi}/fapi/v1/premiumIndex", params={"symbol": symbol}, headers=HEADERS, timeout=8).json()
             funding = float(r_fr["lastFundingRate"]) * 100
 
-            # Локальные экстремумы за 1 час (12 свечей) для стопа
             recent_low = min([float(k[3]) for k in fk[-13:-1]])
             recent_high = max([float(k[2]) for k in fk[-13:-1]])
 
@@ -104,12 +96,11 @@ def get_6_metrics(symbol):
     except Exception:
         pass
 
-    # Попытка 2: Резерв через Bybit V5 API (если сервер GitHub в США и Binance заблокирован)
+    # Попытка 2: Резерв через Bybit V5 API
     try:
         bybit = "https://bybit.com"
         r_bk = requests.get(f"{bybit}/v5/market/kline", params={"category": "linear", "symbol": symbol, "interval": "5", "limit": 60}, headers=HEADERS, timeout=8).json()
         if r_bk.get("retCode") == 0:
-            # Bybit отдает свечи от новых к старым, переворачиваем
             bk = r_bk["result"]["list"][::-1]
             highs = [float(k[2]) for k in bk[:-1]]
             lows = [float(k[3]) for k in bk[:-1]]
@@ -120,27 +111,22 @@ def get_6_metrics(symbol):
             open_p, close_p = float(c_last[1]), float(c_last[4])
             price_pos = (close_p - min_p) / (max_p - min_p) if max_p != min_p else 0.5
 
-            # Оценка дельты по направлению и объему свечи
             f_delta_prev = float(c_prev[6]) if float(c_prev[4]) > float(c_prev[1]) else -float(c_prev[6])
             f_delta_last = float(c_last[6]) if close_p > open_p else -float(c_last[6])
 
-            # Спот Bybit
             r_bsk = requests.get(f"{bybit}/v5/market/kline", params={"category": "spot", "symbol": symbol, "interval": "5", "limit": 3}, headers=HEADERS, timeout=8).json()
             sc_last = r_bsk["result"]["list"][1]
             s_delta_last = float(sc_last[6]) if float(sc_last[4]) >= float(sc_last[1]) else -float(sc_last[6])
 
-            # Открытый интерес Bybit
             r_boi = requests.get(f"{bybit}/v5/market/open-interest", params={"category": "linear", "symbol": symbol, "intervalTime": "5min", "limit": 2}, headers=HEADERS, timeout=8).json()
             oi_list = r_boi["result"]["list"]
             oi_diff_pct = ((float(oi_list[0]["openInterest"]) - float(oi_list[1]["openInterest"])) / float(oi_list[1]["openInterest"])) * 100
 
-            # Стакан Bybit
             r_bob = requests.get(f"{bybit}/v5/market/orderbook", params={"category": "linear", "symbol": symbol, "limit": 50}, headers=HEADERS, timeout=8).json()
             bids_usdt = sum(float(b[0]) * float(b[1]) for b in r_bob["result"]["b"])
             asks_usdt = sum(float(a[0]) * float(a[1]) for a in r_bob["result"]["a"])
             ob_ratio = bids_usdt / asks_usdt if asks_usdt > 0 else 1.0
 
-            # Фандинг Bybit
             r_bfr = requests.get(f"{bybit}/v5/market/tickers", params={"category": "linear", "symbol": symbol}, headers=HEADERS, timeout=8).json()
             funding = float(r_bfr["result"]["list"][0]["fundingRate"]) * 100
 
@@ -174,16 +160,16 @@ def check_coinglass_setup(symbol):
 
     price = d["price"]
 
-    # --- ЛОНГ (Все 6 факторов сошлись на развороте снизу) ---
+    # --- ЛОНГ ---
     long_cond = (
-        d["pos"] <= 0.25 and               # 1. Цена в нижней 25% зоне 5-часового диапазона
-        d["is_green"] and                  # 1.1 Закрылась бычья 5-минутка
-        d["f_delta_prev"] < 0 and          # 2. До этого фьючерсный CVD падал
-        d["f_delta_last"] > 0 and          # 2.1 На последней свече пошел откуп по рынку
-        d["s_delta"] >= 0 and              # 3. Спот поддерживает (нет продаж на споте)
-        d["oi_diff"] > 0.03 and            # 4. Открытый интерес растет (набор лонгов)
-        d["ob_ratio"] > 1.15 and           # 5. В стакане бидов больше асков на 15%+
-        d["funding"] < 0.015               # 6. Нет перегрева лонгов по фандингу
+        d["pos"] <= 0.25 and
+        d["is_green"] and
+        d["f_delta_prev"] < 0 and
+        d["f_delta_last"] > 0 and
+        d["s_delta"] >= 0 and
+        d["oi_diff"] > 0.03 and
+        d["ob_ratio"] > 1.15 and
+        d["funding"] < 0.015
     )
 
     if long_cond:
@@ -208,11 +194,51 @@ def check_coinglass_setup(symbol):
             f"• Фандинг: <b>{round(d['funding'], 4)}%</b>"
         )
 
-    # --- ШОРТ (Все 6 факторов сошлись на развороте сверху) ---
+    # --- ШОРТ ---
     short_cond = (
-        d["pos"] >= 0.75 and               # 1. Цена в верхней 25% зоне 5-часового диапазона
-        not d["is_green"] and              # 1.1 Закрылась медвежья 5-минутка
-        d["f_delta_prev"] > 0 and          # 2. До этого фьючерсный CVD рос
-        d["f_delta_last"] < 0 and          # 2.1 На последней свече пошли рыночные продажи
-        d["s_delta"] <= 0 and              # 3. Спот подтверждает продажи
-        d["oi_diff"] > 0.03 and            # 4. Открытый интерес растет (набор шортов)
+        d["pos"] >= 0.75 and
+        not d["is_green"] and
+        d["f_delta_prev"] > 0 and
+        d["f_delta_last"] < 0 and
+        d["s_delta"] <= 0 and
+        d["oi_diff"] > 0.03 and
+        d["ob_ratio"] < 0.85 and
+        d["funding"] > 0.005
+    )
+
+    if short_cond:
+        sl = round(d["recent_high"] * 1.003, 4)
+        risk = sl - price
+        if risk <= 0:
+            sl = round(price * 1.008, 4)
+            risk = sl - price
+        tp = round(price - (risk * 2.5), 4)
+
+        return (
+            f"🔴 <b>ПОДТВЕРЖДЕННЫЙ ШОРТ ({TIMEFRAME}) — #{symbol}</b>\n\n"
+            f"💵 Вход: <code>{round(price, 4)}</code>\n"
+            f"🛡️ Стоп: <code>{sl}</code> (-{round((risk/price)*100, 2)}%)\n"
+            f"💰 Тейк: <code>{tp}</code> (+{round(((price-tp)/price)*100, 2)}%)\n\n"
+            f"📊 <b>6/6 метрик ({d['source']}):</b>\n"
+            f"• Позиция в канале: <b>{round(d['pos']*100)}%</b> (пик)\n"
+            f"• Фьюч. CVD 5м: <b>{round(d['f_delta_last']/1000, 1)}K$</b> (разворот)\n"
+            f"• Спот CVD 5м: <b>{round(d['s_delta']/1000, 1)}K$</b>\n"
+            f"• Открытый интерес: <b>+{round(d['oi_diff'], 2)}%</b>\n"
+            f"• Стакан (Bid/Ask): <b>{round(d['ob_ratio'], 2)}</b>\n"
+            f"• Фандинг: <b>{round(d['funding'], 4)}%</b>"
+        )
+
+    return None
+
+# --- 5. ЗАПУСК ---
+if __name__ == "__main__":
+    is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+
+    if is_manual:
+        send_telegram("📡 <b>Скринер 6 метрик (CoinGlass-логика, 5m) запущен!</b>\nПроверяю CVD фьючерсов и спота, OI, стакан и фандинг по 12 монетам.")
+
+    found = 0
+    for symbol in SYMBOLS:
+        msg = check_coinglass_setup(symbol)
+        if msg:
+            send_telegram(msg)
