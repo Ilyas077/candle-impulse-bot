@@ -55,10 +55,8 @@ def get_1h_adx(symbol):
     if df is None or len(df) < 30: return 20.0
     h, l, c = df['high'], df['low'], df['close']
     tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    plus_dm = h.diff().clip(lower=0)
-    minus_dm = (-l.diff()).clip(lower=0)
-    plus_dm = np.where(plus_dm > minus_dm, plus_dm, 0.0)
-    minus_dm = np.where(minus_dm > plus_dm, minus_dm, 0.0)
+    plus_dm = np.where(h.diff().clip(lower=0) > (-l.diff()).clip(lower=0), h.diff().clip(lower=0), 0.0)
+    minus_dm = np.where((-l.diff()).clip(lower=0) > h.diff().clip(lower=0), (-l.diff()).clip(lower=0), 0.0)
     atr = tr.ewm(alpha=1/14, adjust=False).mean()
     plus_di = 100 * pd.Series(plus_dm).ewm(alpha=1/14, adjust=False).mean() / atr
     minus_di = 100 * pd.Series(minus_dm).ewm(alpha=1/14, adjust=False).mean() / atr
@@ -77,8 +75,7 @@ def add_reversal_indicators(df):
     return df
 
 def check_reversal(symbol, timeframe, adx_1h):
-    if adx_1h >= 32:
-        return None  # Блокируем контртренд при сильном безоткатном тренде на 1H
+    if adx_1h >= 32: return None
     df = get_candles(symbol, timeframe=timeframe, limit=50)
     if df is None or len(df) < 25: return None
 
@@ -101,7 +98,7 @@ def check_reversal(symbol, timeframe, adx_1h):
             f"💵 Вход: <code>{round(price, 4)}</code>\n"
             f"🛡️ Стоп: <code>{sl}</code>\n"
             f"💰 Тейк: <code>{tp}</code>\n\n"
-            f"📊 RSI: <b>{rsi}</b> | ADX 1H: <b>{adx_1h}</b> (флэт, безопасно)\n"
+            f"📊 RSI: <b>{rsi}</b> | ADX 1H: <b>{adx_1h}</b> (флэт)\n"
             f"💡 <i>Снята нижняя граница Боллинджера, пошел откуп.</i>"
         )
 
@@ -117,7 +114,7 @@ def check_reversal(symbol, timeframe, adx_1h):
             f"💵 Вход: <code>{round(price, 4)}</code>\n"
             f"🛡️ Стоп: <code>{sl}</code>\n"
             f"💰 Тейк: <code>{tp}</code>\n\n"
-            f"📊 RSI: <b>{rsi}</b> | ADX 1H: <b>{adx_1h}</b> (флэт, безопасно)\n"
+            f"📊 RSI: <b>{rsi}</b> | ADX 1H: <b>{adx_1h}</b> (флэт)\n"
             f"💡 <i>Прокол верхней границы Боллинджера, пошел отбой.</i>"
         )
     return None
@@ -138,4 +135,4 @@ if __name__ == "__main__":
         time.sleep(0.4)
 
     if is_manual and found == 0:
-        send_telegram("🧲 <b>Ловец Дна и Пиков (15m/30m + фильтр ADX)</b>: проверка 12 монет завершена, крайних пиков во флэте сейчас нет.")
+        send_telegram("🧲 <b>Ловец Дна и Пиков (15m/30m + ADX)</b>: проверка 12 монет завершена, крайних пиков во флэте сейчас нет.")
